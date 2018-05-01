@@ -1,18 +1,41 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 
+	jwt "github.com/dgrijalva/jwt-go"
+
+	jwtmiddleware "github.com/auth0/go-jwt-middleware"
 	"github.com/gin-gonic/contrib/static"
 	"github.com/gin-gonic/gin"
 )
+
+// Jwks stores a slice of JSON Web Keys
+type Jwks struct {
+	Keys []JSONWebKeys `json:"keys"`
+}
+
+// JSONWebKeys contains information about a single JSON Web Key
+type JSONWebKeys struct {
+	Kty string   `json:"kty"`
+	Kid string   `json:"kid"`
+	Use string   `json:"use"`
+	N   string   `json:"n"`
+	E   string   `json:"e"`
+	X5c []string `json:"x5c"`
+}
 
 // Joke contains information about a single joke
 type Joke struct {
 	ID    int    `json:"id" binding:"required"`
 	Likes int    `json:"likes"`
-	Joke  string `json:"joke" binding: "required"`
+	Joke  string `json:"joke" binding:"required"`
 }
 
 // List of jokes
@@ -26,7 +49,38 @@ var jokes = []Joke{
 	Joke{7, 0, "How does a penguin build it's house? Igloos it together."},
 }
 
+var jwtMiddleWare *jwtmiddleware.JWTMiddleware
+
 func main() {
+
+	jwtMiddleware := jwtmiddleware.New(jwtmiddleware.Options{
+		ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+			aud := os.Getenv("AUTH0_API_AUDIENCE")
+			checkAudience := token.Claims.(jwt.MapClaims).VerifyAudience(aud, false)
+			if !checkAudience {
+				return token, errors.New("invalid audience")
+			}
+
+			// verify iss claim
+			iss := os.Getenv("AUTH0_DOMAIN")
+			checkIss := token.Claims.(jwt.MapClaims).VerifyIssuer(iss, false)
+			if !checkIss {
+				return token, errors.New("invalid issuer")
+			}
+
+			cert, err := getPemCert(token)
+
+			if err != nil {
+				log.Fatalf("could not get cert: %+v", err)
+			}
+
+			result, _ := jwt.ParseRSAPublicKeyFromPEM([]byte(cert))
+			return result, nil
+		},
+		SigningMethod: jwt.SigningMethodRS256,
+	})
+
+	jwtMiddleWare = jwtMiddleware
 
 	// Set the router as the default one shipped with Gin
 	router := gin.Default()
@@ -46,11 +100,54 @@ func main() {
 	// Our api will consist of just two routes
 	// /jokes - which will retrieve a list of jokes a user can see
 	// /jokes/like/:jokeID - wich wull capture likes sent to a particular joke
-	api.GET("/jokes", JokeHandler)
-	api.POST("/jokes/like/:jokeID", LikeHandler)
+	api.GET("/jokes", authMiddleware(), JokeHandler)
+	api.POST("/jokes/like/:jokeID", authMiddleware(), LikeJoke)
 
 	// Start and run the server
 	router.Run(":3000")
+}
+
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Get the client secret key
+		err := jwtMiddleWare.CheckJWT(c.Writer, c.Request)
+		if err != nil {
+			// Token not found
+			fmt.Println(err)
+			c.Abort()
+			c.Writer.WriteHeader(http.StatusUnauthorized)
+			c.Writer.Write([]byte("Unauthorized"))
+		}
+	}
+}
+
+func getPemCert(token *jwt.Token) (string, error) {
+	cert := ""
+	resp, err := http.Get(os.Getenv("AUTH0_DOMAIN") + ".well-known/jwks.json")
+	if err != nil {
+		return cert, err
+	}
+	defer resp.Body.Close()
+
+	var jwks = Jwks{}
+	err = json.NewDecoder(resp.Body).Decode(&jwks)
+
+	if err != nil {
+		return cert, err
+	}
+
+	x5c := jwks.Keys[0].X5c
+	for k, v := range x5c {
+		if token.Header["kid"] == jwks.Keys[k].Kid {
+			cert = "-----BEGIN CERTIFICATE-----\n" + v + "\n-----END CERTIFICATE-----"
+		}
+	}
+
+	if cert == "" {
+		return cert, errors.New("unable to find appropriate key")
+	}
+
+	return cert, nil
 }
 
 // JokeHandler retrieves a list of available joke
@@ -59,8 +156,8 @@ func JokeHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, jokes)
 }
 
-// LikeHandler increments the likes of a particular joke
-func LikeHandler(c *gin.Context) {
+// LikeJoke increments the likes of a particular joke
+func LikeJoke(c *gin.Context) {
 	// confirm is Joke ID sent is valid
 	// remember to import `strconv`package
 	if jokeid, err := strconv.Atoi(c.Param("jokeID")); err == nil {
